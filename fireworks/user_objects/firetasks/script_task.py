@@ -6,8 +6,12 @@ import shlex
 import subprocess
 import sys
 
+import h5py
+
 from fireworks.core.firework import FireTaskBase, FWAction
 from six.moves import builtins
+
+from nanshe.util.pathHelpers import PathComponents
 
 __author__ = 'Anubhav Jain'
 __copyright__ = 'Copyright 2013, The Materials Project'
@@ -174,3 +178,87 @@ class PyTask(FireTaskBase):
         output = func(*args, **kwargs)
         if self.get("stored_data_varname"):
             return FWAction(stored_data={self["stored_data_varname"]: output})
+
+
+class PyWrappedHDF5Task(FireTaskBase):
+    _fw_name = "PyWrappedHDF5Task"
+
+    __doc__ = """
+    Runs any python function! Extremely powerful, which allows you to
+    essentially run any accessible method on the system.
+
+    Additionally, provides a mechanism of efficiently serializing arrays in and
+    out from the task. Namely, it allows the user to specify,
+
+    Args:
+        func (str): Fully qualified python method. E.g., json.dump, or shutil
+            .copy, or some other function that is not part of the standard
+            library!
+        args (list): List of args. Default is empty.
+        kwargs (dict): Dictionary of keyword args. Default is empty.
+        hdf5_args (list): Indices of args that need to be read from HDF5 files.
+        hdf5_kwargs (list): Names of args that need to be read from HDF5 files.
+        stored_data_varname (str): Whether to store the output in
+            FWAction. If
+            this is a string that does not evaluate to False, the output of
+            the function will be stored as
+            FWAction(stored_data={stored_data_varname: output}). The name is
+            deliberately long to avoid potential name conflicts.
+
+        All other params not starting with "_" are supplied as keyword args
+        to the Python method.
+    """
+
+    required_params = ["func"]
+    optional_params = [
+        "args", "kwargs", "hdf5_args", "hdf5_kwargs", "hdf5_result",
+        "stored_data_varname"
+    ]
+
+    def run_task(self, fw_spec):
+        args = self.get("args", [])
+        kwargs = self.get("kwargs", {})
+
+        hdf5_args = self.get("hdf5_args", [])
+        hdf5_kwargs = self.get("hdf5_kwargs", {})
+
+        for each_hdf5_arg in hdf5_args:
+            if each_hdf5_arg < len(args):
+                each_hdf5_pc = PathComponents(args[each_hdf5_arg])
+                each_filename, each_datasetpath = each_hdf5_pc.externalPath, \
+                                                  each_hdf5_pc.internalPath
+                with h5py.File(each_filename, "r") as hdf5:
+                    args[each_hdf5_arg] = hdf5[each_datasetpath][...]
+
+        for each_hdf5_kwarg in hdf5_kwargs:
+            if each_hdf5_kwarg in kwargs:
+                each_hdf5_pc = PathComponents(kwargs[each_hdf5_kwarg])
+                each_filename, each_datasetpath = each_hdf5_pc.externalPath, \
+                                                  each_hdf5_pc.internalPath
+                with h5py.File(each_filename, "r") as hdf5:
+                    kwargs[each_hdf5_kwarg] = hdf5[each_datasetpath][...]
+
+        self["args"] = args
+        self["kwargs"] = kwargs
+
+        toks = self["func"].rsplit(".", 1)
+        if len(toks) == 2:
+            modname, funcname = toks
+            mod = __import__(modname, globals(), locals(), [str(funcname)], 0)
+            func = getattr(mod, funcname)
+        else:
+            # Handle built in functions.
+            func = getattr(builtins, toks[0])
+
+        output = func(*args, **kwargs)
+        if self.get("hdf5_result", ""):
+            hdf5_result_pc = PathComponents(self.get("hdf5_result"))
+            result_filename, result_datasetpath = hdf5_result_pc.externalPath, \
+                                                  hdf5_result_pc.internalPath
+            with h5py.File(result_filename, "a") as hdf5:
+                hdf5[result_datasetpath] = output
+
+            output = self.get("hdf5_result")
+
+        if self.get("stored_data_varname", ""):
+            return(FWAction(stored_data={self["stored_data_varname"]: output}))
